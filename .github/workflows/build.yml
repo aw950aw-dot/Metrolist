@@ -1,0 +1,142 @@
+name: Build APKs
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Which build to make"
+        type: choice
+        options:
+          - release
+          - debug
+        default: release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_release:
+    name: Build Release (gms)
+    if: ${{ inputs.variant == 'release' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Set Up Gradle
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          cache-cleanup: on-success
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # The signing key is kept in the Actions cache so every build uses the
+      # same signature and new versions can update the installed app.
+      - name: Restore signing key
+        id: keystore-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/signing
+          key: release-keystore-v1
+
+      - name: Create signing key (first run only)
+        if: steps.keystore-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/signing
+          keytool -genkeypair -v \
+            -keystore ~/signing/release.keystore \
+            -storepass metrolist -keypass metrolist \
+            -alias release \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Metrolist Personal,O=Personal,C=IL"
+
+      - name: Build Release APK
+        run: ./gradlew --console=plain assembleGmsRelease --warning-mode summary
+        env:
+          METROLIST_APPLICATION_ID: com.metrolist.music
+          METROLIST_APP_NAME: Metrolist Nightly
+          METROLIST_BUILD_COMMIT: ${{ github.sha }}
+          PULL_REQUEST: "false"
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+
+      - name: Sign APKs
+        run: |
+          set -e
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          APKSIGNER=$(ls "$SDK"/build-tools/*/apksigner | sort -V | tail -1)
+          mkdir -p signed
+          for apk in app/build/outputs/apk/gms/release/*.apk; do
+            "$APKSIGNER" sign \
+              --ks ~/signing/release.keystore \
+              --ks-pass pass:metrolist --key-pass pass:metrolist \
+              --ks-key-alias release \
+              --out "signed/$(basename "$apk" .apk)-signed.apk" \
+              "$apk"
+          done
+          ls -la signed
+
+      - name: Upload Signed APKs
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-release-gms
+          path: signed/*.apk
+
+  build_debug:
+    name: Build Debug (gms)
+    if: ${{ inputs.variant == 'debug' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Set Up Gradle
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          cache-cleanup: on-success
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Create debug keystore
+        run: |
+          mkdir -p ~/.android
+          keytool -genkeypair -v \
+            -keystore ~/.android/debug.keystore \
+            -storepass android -keypass android \
+            -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Build Debug APK
+        run: ./gradlew --console=plain assembleGmsDebug --warning-mode summary
+        env:
+          METROLIST_APPLICATION_ID: com.metrolist.music
+          METROLIST_APP_NAME: Metrolist Nightly
+          METROLIST_BUILD_COMMIT: ${{ github.sha }}
+          PULL_REQUEST: "false"
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-debug-gms
+          path: app/build/outputs/apk/gms/debug/*.apk
